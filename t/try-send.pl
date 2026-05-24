@@ -15,17 +15,18 @@ my $nt = new Net::BCCN PORT => 1122;
 
 $nt->open() or die "cannot open sockets: " . $nt->err();
 
-print Dumper( $nt );
+#print Dumper( $nt );
 
-sleep 2;
+#sleep 2;
+$nt->notify( 'ztest', `fortune` );
+$nt->notify( 'ztest', `fortune` );
+$nt->notify( 'ztest', `fortune` );
+$nt->notify( 'ztest', `fortune` );
+$nt->notify( 'test1', `fortune` );
+$nt->notify( 'test1', `fortune` );
+$nt->notify( 'test1', `fortune` );
+$nt->notify( 'test1', `fortune` );
 $nt->notify( 'test', `fortune` );
 $nt->notify( 'test', `fortune` );
 $nt->notify( 'test', 'WOW ' . `fortune` );
-$nt->notify( 'ztest', `fortune` );
-$nt->notify( 'ztest', `fortune` );
-$nt->notify( 'ztest', `fortune` );
-$nt->notify( 'ztest', `fortune` );
-$nt->notify( 'test1', `fortune` );
-$nt->notify( 'test1', `fortune` );
-$nt->notify( 'test1', `fortune` );
-$nt->notify( 'test1', `fortune` );
+
