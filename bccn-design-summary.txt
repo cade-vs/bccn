@@ -1,0 +1,1033 @@
+
+  BCCN - Broadcast Channel Notify protocol
+  Cross-machine LISTEN/NOTIFY-style messaging over UDP
+  broadcast on a single network segment
+
+  (c) Vladi Belperchinov-Shabanski "Cade" 2026
+  http://cade.noxrun.com <cade@noxrun.com>
+
+
+
+DISCLAIMER
+================================================================
+
+Everything described here is a prototype. Working implementation
+is available in Perl from this repository. Changes above the
+baseline functionality may change anytime. This document will
+follow changes and proper documentation as far as it describes
+more concepts than the documentation. After that it may be
+dropped.
+
+BCCN is not standard of any kind, it is just a thing I need and
+do not want to use more complex existing solutions. If it looks
+like something someone may happen to need/like, help is always
+welcome :)
+
+This document may be messy too :)
+
+
+
+DESIGN NOTES
+================================================================
+
+This text summarises notes on the design discussion for a
+simple lightweight channel-like messaging between programs
+running on several machines in one network segment.
+
+This was inspired by PostgreSQL's NOTIFY/LISTEN api: small
+messages addressed to a 'channels'. However this requires all
+programs to be connected to the same PGSQL cluster so it was
+not useful for programs in the same group but not requiring
+database.
+
+BCCN keeps the PGSQL spirit, uses small text messaging (yet binary
+is possible) transported with UDP datagrams on shared port number
+between all programs in the group. Currently only broadcast is
+supported but multicast is in discussion.
+
+
+
+GOAL
+----------------------------------------------------------------
+
+Very simple notify/messaging mechanism between processes on multiple
+machines with these properties:
+
+  -- LISTEN/NOTIFY semantics: named channels, fire-and-forget,
+     lightweight, no persistence, payloads.
+
+  -- Processes run on different machines.
+
+  -- Processes do not share a database. Different parts of the
+     system use different databases (PostgreSQL, Oracle, ...).
+
+  -- Language-agnostic: must be implementable trivially in C,
+     C++, Perl, or anything else with a UDP socket.
+
+  -- Avoid database-native APIs since they require DB connections
+
+  -- Avoid broker architectures like Redis / MQTT, because it adds
+     more complexity and questionable features, which can be
+     achieved if neccessary with higher-level logic.
+
+
+
+DESIGN: UDP BROADCAST WITH CHANNEL-NAME HEADER
+----------------------------------------------------------------
+
+Each notification is a single UDP datagram sent to the
+segment broadcast address on a fixed port. The datagram
+begins with a plain-text header that includes the channel
+name. Receivers bind the port, parse the header, and deliver
+the message to local listeners that have registered interest
+in the channel name.
+
+Brokerless. No daemon to run. No SPOF. Drops cleanly into an
+select / poll / epoll style event loop on any platform.
+
+
+
+DELIVERY: UDP BROADCAST (single segment)
+----------------------------------------------------------------
+
+All BCCN participants live on the same L2 network segment.
+Datagrams use the broadcast address on a fixed port; every
+host on the segment receives every datagram, and per-message
+addressing is done in the channel field (plain channel name,
+"!", or "!<target>") as described in WIRE FORMAT.
+
+Two broadcast address flavours:
+
+  Limited broadcast    255.255.255.255
+    * Delivered to all hosts on the immediately attached
+      L2 segment.
+    * Never forwarded by any router, regardless of config.
+      Fully segment-local by definition.
+    * Works on all interfaces by default; kernel uses
+      routing table to pick one. On multi-NIC hosts pin
+      with SO_BINDTODEVICE or send per-interface explicitly.
+
+  Directed (subnet) broadcast    e.g. 10.0.0.255 for 10.0.0.0/24
+    * Delivered to all hosts on the specified subnet.
+    * Historically routable, but most modern routers block
+      directed broadcasts inbound by default (RFC 2644)
+      to prevent smurf-attack amplification.
+    * On a single-segment deployment, behaves identically
+      to limited broadcast for practical purposes.
+
+Recommendation: limited broadcast (255.255.255.255). Most
+portable, fewest surprises, never escapes the segment.
+
+
+
+WIRE FORMAT  (BCCN1)
+----------------------------------------------------------------
+
+The wire format has two layers:
+
+  envelope layer  - version-independent. Magic name, fixed-
+                    syntax metadata block "[...]", body bytes.
+  body layer      - version-specific. BCCN1 uses three
+                    colon-separated header fields followed
+                    by a "|" delimiter and an payload/message;
+                    future versions may change body syntax
+                    without changing the envelope.
+
+This format lets tooling (sniffers, logging proxies, HMAC-
+verifying intermediaries) work generically across BCCN
+versions: anything that needs to authenticate or measure a
+message can do so without understanding the body format.
+
+Can be easily traced with tcpdump, f.e.
+
+
+
+ENVELOPE LAYER  (stable across versions)
+================================================================
+
+Each datagram:
+
+  <magic>[<len><:<algo>=<sum>>?]<body-bytes>
+
+  magic       protocol identifier and version, e.g. "BCCN1",
+              "BCCN2", "BCCN1a", ... Receivers branch on
+              this string to dispatch to the body parser.
+  [...]      a fixed, minimal envelope holding at most two
+              things: body length and (optionally) an
+              integrity check. Not a general metadata bag.
+              No whitespace inside.
+  <body>     exactly <len> bytes of body content, opaque at
+              the envelope layer.
+
+The bracket holds exactly two known parts:
+
+  <len>      decimal byte count of the body that follows "]".
+             Mandatory. Always the first content in the
+             bracket. Receiver cross-checks against the
+             datagram size from recvfrom() and drops on
+             mismatch.
+
+  <algo>=<sum>   optional. Integrity check over the <len>
+             body bytes following "]". Two sub-parts joined
+             by "=":
+               <algo>  short lowercase name of the algorithm
+                       producing the check (e.g. "hmac",
+                       "crc32", "sig").
+               <sum>   the check value, hex-encoded for
+                       printability.
+             Separated from <len> by ":". Absent when no
+             integrity check is in use.
+
+  Nothing else. Anything else - source, sequence, channel,
+  payload structure, message-class hints, compression flags -
+  belongs in the body, not the envelope. The envelope is
+  deliberately small and fixed so that authenticating /
+  framing intermediaries can parse it without any version
+  knowledge.
+
+Parsing:
+
+  Finding the three (or two) parts is mechanical:
+
+    after the magic, "[" begins the envelope.
+    "]" closes it.
+    inside, find the first ":" (if any):
+      everything before ":" is <len>
+      after ":", find "=":
+        everything before "=" is <algo>
+        everything after "=" is <sum>
+    if no ":", the whole inside is <len>.
+
+  Three substrings, located by two delimiters. No tokenising
+  loop, no key/value map, no order to consider.
+
+Envelope examples:
+
+  BCCN1[42]<body>
+    body is 42 bytes, no integrity check.
+
+  BCCN1[42:hmac=a1b2c3d4e5f60718]<body>
+    body is 42 bytes, integrity check is the named algo
+    "hmac" with the given value.
+
+  BCCN1[42:crc32=deadbeef]<body>
+    same shape, different algo.
+
+Integrity computation:
+
+  Sender:
+    after constructing the body bytes, run the chosen algo
+    over them, hex-encode the result, include
+    "<algo>=<hex>" in the envelope after the ":".
+  Receiver:
+    if the bracket contains a ":", parse <algo> and <sum>,
+    look up the algo, run it over the <len> body bytes
+    after "]", compare to <sum>.
+
+  The hashed range is unambiguous - it is exactly the
+  contiguous <len> bytes after "]". The check itself lives
+  inside the brackets, before "]", and is not part of its
+  own input. No reconstruction, no field stripping, no
+  canonicalisation.
+
+  Whether an integrity check is in use - and which algo -
+  is a deployment-wide agreement. The "algo=" prefix makes
+  the wire self-identifying: senders and receivers running
+  different algos will mismatch loudly rather than silently
+  validating wrong bytes.
+
+
+
+BODY LAYER  (BCCN1)
+================================================================
+
+For magic == "BCCN1", the body is ASCII text:
+
+  <src>:<seq>:<chan>|<payload-bytes>
+
+Three colon-separated header fields, "|" delimiter, then
+opaque payload bytes. Total length matches <len> from the
+envelope.
+
+The three fields are exactly:
+
+  from / source        : <src>
+  sequence number      : <seq>
+  to / destination     : <chan>
+
+Reading top-to-bottom: "from <src>, message <seq>, to
+<chan>". Nothing else lives in the body header. Anything
+else lives in the payload.
+
+Body fields:
+
+  <src>     sender identifier ("from"). Opaque string,
+            1-128 ASCII characters, no whitespace, no '|',
+            no ':'. Must be unique per independent sender
+            in the topology, otherwise sequence-number
+            dedup collides. Receivers treat it as a byte-
+            for-byte opaque key for the dedup tracker.
+            No internal structure is mandated by the
+            protocol.
+
+            One reserved value:
+              -- src equal to exactly "?"
+                  * sender does not know its own identity at
+                    the moment of sending (not yet set, not
+                    discoverable from the environment, or
+                    deliberately unattributed).
+                  * the message is still delivered to every
+                    receiver's listener layer via bccn_recv()
+                    or equivalent; receivers MAY choose to
+                    ignore it, but that is a listener-layer
+                    decision, not a protocol-layer drop.
+                  * sequence-number dedup can be keyed on
+                    the src or sender IP (when src is "?")
+                    or on both together.
+                  * "?" is not meant to appear as a target
+                    in directed channels ("!?..." has no
+                    meaningful interpretation and should be
+                    dropped by receivers).
+  <seq>     sequence number. Decimal, per-sender,
+            unsigned 64-bit.
+  <chan>    channel name ("to"). Opaque string, 1-1024
+            ASCII characters, no whitespace, no '|', no ':'.
+            The '!' character carries protocol-level meaning
+            when it appears as the first byte:
+              -- chan equal to exactly "!"
+                  * all-form: every listener receives the
+                    message, regardless of which channel
+                    names they have registered interest in.
+              -- chan starting with "!" followed by more
+                 characters
+                  * directed form: the substring after "!"
+                    is the target src (or src-pattern with
+                    a trailing "*", see below). Only
+                    receivers whose own src matches the
+                    target process the message.
+            Any other content is a plain channel name -
+            opaque to the protocol, meaningful only to the
+            sender and receivers that agree on its semantics.
+            The chan field in directed form carries only
+            identity. "What this message is about" lives
+            entirely in the payload.
+  payload   the bytes after "|" until the end of the body
+            (len bytes total from "]"). Opaque to the
+            protocol, format is sender/receiver agreement.
+
+Parser: find the first "|" in the body. Everything before
+it is the colon-separated header; split on ":" into exactly
+three fields (src, seq, chan). Everything after the "|" up
+to the end of <len> is payload.
+
+A separate paylen header field is not needed; payload length
+is implied by <len> from the envelope minus the bytes used
+by the body header before "|".
+
+Note on future body layouts:
+
+  A BCCN2 body could use a different syntax entirely - a
+  different field set, a different delimiter, a binary TLV
+  layout, or anything else. The envelope stays the same:
+    BCCN2[<n>:hmac=<hex>]<body>
+  Receivers and intermediaries that only care about
+  authentication, framing, or routing-by-magic can keep
+  working without understanding body internals.
+
+Directed-form matching:
+
+  After stripping the leading "!", the remainder is the
+  target. The target is classified as exact or wildcard:
+
+  Classification:
+
+    1. If target ends with "/*", it is wildcard. Strip the
+       trailing "/*" to get the match prefix.
+    2. Else if target's last token (the substring after the
+       last "/", or the whole target if there is no "/")
+       consists entirely of ASCII decimal digits, target
+       is exact. The whole target is the match value.
+    3. Otherwise target is wildcard. The whole target is
+       the match prefix.
+
+  Match rule:
+
+    exact target:
+      match if my_src == target
+
+    wildcard target (after stripping any trailing "/*"):
+      match if my_src == prefix
+         OR my_src starts with prefix + "/"
+
+  Rationale: process srcs end in a numeric pid by convention
+  (host/name/pid, host/name/pid/child-pid, ...). A target
+  whose last token is numeric points at one specific process
+  and matches only that process. A target whose last token
+  is non-numeric (a hostname, a program name, a worker tag)
+  cannot identify a single process - the only sensible
+  reading is "everything that extends this prefix". An
+  explicit trailing "/*" overrides the classification and
+  forces wildcard, which is the only way to say "this pid
+  and all its forks".
+
+  Examples:
+
+    "!host/name/12345"            (last token 12345 numeric)
+      EXACT. Matches only "host/name/12345". Does NOT
+      match "host/name/12345/4711" or any other src.
+
+    "!host/name/12345/*"          (explicit /*)
+      WILDCARD on prefix "host/name/12345".
+      Matches "host/name/12345" itself plus every fork:
+        "host/name/12345/4711"
+        "host/name/12345/4711/9012"
+
+    "!host/name/12345/4711"       (last token 4711 numeric)
+      EXACT. Matches only that grandchild.
+
+    "!host/name"                  (last token non-numeric)
+      WILDCARD on prefix "host/name". Matches every
+      "host/name/..." src.
+
+    "!host/name/*"                (explicit /*)
+      Same as "!host/name" - wildcard on "host/name".
+
+    "!host"                       (last token non-numeric)
+      WILDCARD on prefix "host". Matches every "host/..."
+      src.
+
+    "!host/cardsys-relay/12345/worker-3"
+      (last token worker-3 non-numeric)
+      WILDCARD on prefix "host/cardsys-relay/12345/worker-3".
+      Matches that worker and any further forks of it.
+
+  Short-form summary:
+
+    !host                  ==  !host/*
+    !host/name             ==  !host/name/*
+    !host/name/12345       =/= !host/name/12345/*
+                           (exact vs wildcard - they differ
+                            in whether forks of 12345 match)
+
+Reserved characters:
+
+  -- ":" (colon): two distinct roles in different positions.
+    Inside the envelope brackets, separates the envelope
+    parts (<len> from <algo>=<sum>). In the BCCN1 body
+    header, separates the three header fields (src, seq,
+    chan). Not allowed inside src or chan in either role.
+  -- "|" (single byte): in the BCCN1 body, separates the
+    body header from the payload. The first "|" byte in
+    the body marks the boundary; src and chan therefore
+    cannot contain "|".
+  -- "[" and "]" : envelope brackets. "[" immediately
+    follows the magic, "]" closes the envelope. No
+    whitespace inside the brackets.
+  -- "!" as the first character of chan: reserved for the
+    all and directed forms. Plain channel names should not
+    begin with "!".
+  -- "/*" as the trailing two characters of a directed-form
+    target: forces wildcard classification (overrides the
+    numeric-last-token rule). Outside this trailing position,
+    "*" has no protocol-level meaning and "/" is just a byte.
+  -- src equal to exactly "?": reserved as the
+    unknown-sender placeholder. "?" anywhere inside src
+    other than as the entire value has no protocol-level
+    meaning.
+  -- ASCII whitespace: not used as a delimiter in BCCN1
+    and not allowed inside src or chan.
+
+The payload is opaque and may contain any bytes including
+"|", CR, LF, NUL, "[", "]" - it sits inside the body's
+<len>-byte region and is delimited by position, not by
+content. Body and envelope parsing never scan the payload
+bytes for structural markers.
+
+A src should not contain "*" or end with "/". The wildcard
+notation is meaningful only as a directed-channel target;
+embedding it inside the sender's own src would be ambiguous.
+
+No other characters are reserved. All bytes other than
+whitespace and the position-dependent reservations above
+are legal in src and chan.
+
+Working datagram size limit: 1400 bytes. Treat as a hard
+ceiling rather than a guideline - fragmented UDP loses the
+whole datagram on any one fragment drop, and 1400 stays
+under any reasonable tunnel/VLAN overhead.
+
+Wire-format examples (src and chan content shown is purely
+illustrative - the protocol treats both as opaque strings):
+
+In each example below, the visual line break between body
+header and payload is editorial - on the wire the entire
+datagram is one contiguous byte sequence: magic, "[meta]",
+then exactly <len> bytes of body. The body's body-header
+ends at the first "|" byte; everything after that until the
+end of <len> is payload. Any "|" inside the payload is
+just payload content, not framing. Byte counts in the
+examples are illustrative.
+
+Example (no HMAC):
+
+  BCCN1[98]relay01/cardsys-relay/12345:84213:cardsys/relay/tx/authorized|
+  txnid=12345|amount=1234|rc=00|ts=...
+
+Example (with HMAC):
+
+  BCCN1[98:hmac=a1b2c3d4e5f60718]relay01/cardsys-relay/12345:84213:cardsys/relay/tx/authorized|
+  txnid=12345|amount=1234|rc=00|ts=...
+
+  Envelope reads: magic BCCN1, body length 98 bytes, hmac
+  a1b2c3d4e5f60718. Hmac is computed over the 98 bytes
+  after "]".
+
+Example (unknown sender - src not yet identified):
+
+  BCCN1[33]?:1:bootstrap/started|
+  pid=unknown
+
+Example (forked worker with appended own pid):
+
+  BCCN1[103]relay01/cardsys-relay/12345/4711:17:cardsys/relay/tx/authorized|
+  txnid=12345|amount=1234|rc=00|ts=...
+
+Example (directed to exactly one process - last token is a pid):
+
+  Target's last token "12345" is numeric, so this is an
+  EXACT match: only the process with that src receives it.
+  Forks/descendants do NOT receive it.
+
+  BCCN1[68]mon01/monitor/8821:9:!relay01/cardsys-relay/12345|
+  cmd=reload-config
+
+Example (directed reply):
+
+  BCCN1[58]relay01/cardsys-relay/12345:10:!mon01/monitor/8821|
+  status=ok|cfg=42
+
+Example (directed to a process AND its forks - explicit /*):
+
+  Same prefix as above plus "/*" forces WILDCARD.
+
+  BCCN1[64]mon01/monitor/8821:11:!relay01/cardsys-relay/12345/*|
+  cmd=shutdown
+
+Example (directed to every process of a given name):
+
+  Last token "cardsys-relay" is non-numeric, so implicit
+  WILDCARD. "!relay01/cardsys-relay" and
+  "!relay01/cardsys-relay/*" select the same set.
+
+  BCCN1[58]mon01/monitor/8821:12:!relay01/cardsys-relay|
+  cmd=drain-mode
+
+Example (directed to every process on a host):
+
+  Last token "relay01" is non-numeric, so implicit WILDCARD.
+
+  BCCN1[44]mon01/monitor/8821:13:!relay01|
+  cmd=drain-mode
+
+Example (all-broadcast - every listener gets it):
+
+  BCCN1[44]ops01/admin-tool/4711:42:!|
+  emergency-shutdown
+
+Example (minimal - flat unstructured names also valid):
+
+  BCCN1[24]sensor7:1:temperature|
+  72.4F
+
+
+
+SEQUENCE NUMBERS AND DEDUP
+----------------------------------------------------------------
+
+  -- Per-sender sequence, monotonically increasing, starts at
+     a value of the sender's choice (1, or epoch seconds).
+
+  -- "Sender" here means a unique src string. Two processes
+     with different src values are independent senders, each
+     with their own seq counter and their own tracker entry
+     on receivers. This is why src must be globally unique
+     across the topology (host + program + pid + optional tag).
+
+  -- Receivers track (src -> last_seq_seen) in a hash/map keyed
+     by the full src string. The tracker key can be keyed on
+     the src or sender IP (when src is "?") or on both
+     together; listener-layer choice.
+
+  -- On receive:
+      * if seq <= last_seen and last_seen - seq < SANITY,
+        treat as duplicate or stale, drop.
+      * else accept, update last_seen.
+
+  -- Sender restart detected by sharp seq drop. Reset tracker
+     for that src.
+
+  -- Long-running receivers should expire tracker entries for
+     sources that have not been seen for some time
+     (e.g. 24 hours). With short-lived processes such as
+     forked workers, sources come and go; without expiry the
+     table grows unboundedly. If the heartbeat convention
+     (see API LAYERS) is in use, tie expiry to heartbeat
+     absence: drop the tracker entry when no heartbeat has
+     been seen from that src for N intervals. Without
+     heartbeats, an absolute timeout works.
+
+
+
+LOSS REDUCTION
+----------------------------------------------------------------
+
+UDP can drop. On an idle gigabit LAN with small packets,
+loss is typically very low, but not zero.
+
+To reduce loss for things that matter more than typical
+notifications:
+
+  -- Send each datagram twice with the same seq. Receiver
+     dedupes via the seq tracker. Doubles bandwidth, makes
+     loss probability quadratic-small.
+
+For events that must arrive reliably: BCCN is not the right
+fabric.
+
+
+
+HMAC
+----------------------------------------------------------------
+
+Optional but recommended on any LAN where untrusted parties
+might be present.
+
+  -- Shared secret known to all legitimate publishers and
+    subscribers. Distribute out of band (e.g. file under
+    /etc with 0600 perms).
+  -- Algorithm name: "hmac". The hex value is HMAC-SHA-256
+    truncated to first 8 bytes, encoded as 16 lowercase hex
+    chars.
+  -- Position: as the optional second part of the envelope:
+    "BCCN1[<len>:hmac=<hex>]<body>". See WIRE FORMAT.
+  -- Input: the <len> body bytes that follow the "]" byte.
+    A contiguous, well-defined byte range that appears
+    unchanged on the wire. The hmac itself lives inside
+    the brackets, before "]", and is not part of its own
+    input.
+  -- No canonicalisation, no field stripping, no whitespace
+    normalisation. The HMAC binds the exact body bytes
+    transmitted. Verifier never has to reconstruct what
+    the signer hashed.
+  -- Receiver uses constant-time comparison.
+
+Purpose: authentication and integrity. Defeats forgery and
+tampering. Does not provide confidentiality - payloads are
+in cleartext on the wire. If confidentiality is needed,
+either encrypt the payload at the application layer or
+wrap the whole thing in DTLS / IPsec.
+
+8-byte truncated HMAC-SHA-256 is standard practice (RFC 2104
+allows truncation). Forgery probability per attempt is 2^-64.
+
+Other integrity algorithms slot into the same envelope
+position by changing the algo name: "crc32=<hex>" for a
+non-cryptographic check, "sig=<hex>" for an asymmetric
+signature, etc. The envelope shape is fixed at three parts
+(len, optional algo, optional value); the algo name is the
+only place where extensibility lives.
+
+
+
+CHAN FORMS AND DELIVERY ALGORITHM
+----------------------------------------------------------------
+
+The protocol distinguishes three forms of the chan field
+based on its leading byte and overall value. The chan field
+in directed form carries identity only, no topic. Anything
+the message is "about" lives in the payload.
+
+  Form          chan content       Receiver action
+  ----          --------------     ----------------------------
+  plain         "..." (no '!')     Pass chan and payload to
+                                   local listener layer.
+  all           "!" (exactly)      Deliver unconditionally to
+                                   every listener regardless
+                                   of registered interests.
+  directed      "!<target>"        Classify target as exact
+                                   or wildcard (see WIRE
+                                   FORMAT for the rules);
+                                   match my_src accordingly;
+                                   non-matching receivers
+                                   drop silently.
+
+Security note:
+
+  HMAC verification needs to happen before the directed-
+  form match check. Otherwise an attacker could send forged
+  datagrams addressed to any instance without being
+  authenticated. The dropped-silently semantics for non-
+  matching directed messages is purely a routing optimisation,
+  not a security boundary.
+
+
+
+LANGUAGE INDEPENDENCE
+----------------------------------------------------------------
+
+The whole protocol is "UDP socket + 50 lines of text parsing".
+Every language with a stdlib network module can implement
+either side without any external dependency:
+
+  -- C: <sys/socket.h>, sendto, recvfrom
+  -- C++: same, optional thin wrappers
+  -- Perl: IO::Socket::IP with Broadcast => 1
+  -- Python: socket module with SO_BROADCAST
+  -- Go: net.ListenPacket on "udp"
+  -- Rust: std::net::UdpSocket with set_broadcast(true)
+  -- Shell debugging: socat with UDP4-DATAGRAM,broadcast;
+     tcpdump -A for inspection
+
+The contract is the wire format, not the implementation.
+
+
+
+DEBUGGING
+----------------------------------------------------------------
+
+  -- tcpdump -i any -A -n udp port 5400 and broadcast
+        or "and host 255.255.255.255"
+
+  -- socat subscriber:
+      socat - UDP4-RECV:5400,reuseaddr
+
+  -- socat publisher:
+      echo -n "BCCN1[21]test:1:test/chan|hello" | \
+        socat - UDP4-DATAGRAM:255.255.255.255:5400,broadcast
+
+  -- quick send with bash + /dev/udp does NOT work for
+     broadcast (no SO_BROADCAST). Use socat or netcat-openbsd
+     with -b.
+
+
+
+API LAYERS
+----------------------------------------------------------------
+
+The protocol itself defines only one data path. Real
+implementations are usefully organised as two layers:
+
+  fundamental layer  - speaks the wire format directly
+  convention layer   - imposes structure on src and chan,
+                       offers higher-level subscribe/publish
+                       with name patterns
+
+The fundamental layer is small and stable. The convention
+layer is where each deployment makes choices.
+
+
+
+FUNDAMENTAL CALLS  (every implementation provides these)
+================================================================
+
+Two functions, exact names vary by language binding but the
+shape is the same:
+
+  bccn_send(src, chan, payload [, hmac_key])
+    Build the BCCN1 datagram with the next per-process seq,
+    optional HMAC, send it over the configured socket.
+    src and chan are opaque strings supplied by the caller.
+    If src is empty, NULL, or otherwise unavailable, the
+    binding substitutes "?" before transmitting; the
+    reserved "?" value signals "sender identity unknown at
+    this moment" to receivers.
+
+  bccn_recv() -> (src, chan, payload, peer_addr)
+    Receive one datagram, parse the header, verify HMAC if
+    a key is configured, return the parsed fields plus the
+    sender's network address (peer_addr - the source IP and
+    port from recvfrom()). Also return delivery-mode
+    (PLAIN / ALL / DIRECTED) as another field, or as a flag
+    on chan, or both - binding's choice.
+    Messages with src == "?" are returned to the caller like
+    any other message; the listener-layer code decides
+    whether to act on them, ignore them, or use peer_addr
+    as a substitute identity for dedup or other purposes.
+    The protocol layer never drops based on src.
+
+These are sufficient. A program can call bccn_send and
+bccn_recv directly with any src and chan values that make
+sense for its environment, and impose whatever semantics it
+likes on top.
+
+Useful supporting calls in any binding:
+
+  bccn_open(bcast_addr, port [, hmac_key])
+    Set up the socket bound to <port> and configured for
+    broadcast on <bcast_addr> (typically 255.255.255.255).
+
+  bccn_close()
+    Drop the socket.
+
+  bccn_fd()
+    Return the underlying file descriptor for integration
+    into select/poll/epoll loops.
+
+  bccn_get_name()  -> src
+  bccn_set_name(src)
+    Read or set this process's own src string ("name" in
+    the API, "src" on the wire). Used as the default src
+    in bccn_send and for the directed-delivery src-match
+    test in bccn_recv. Until bccn_set_name is called (or
+    if it is called with an empty/null argument), the
+    binding uses "?" as the default src on outgoing
+    datagrams. The directed-delivery src-match test treats
+    "?" as never-matching, so a process with src == "?"
+    never accepts directed messages.
+
+  bccn_get_seq()  -> n
+  bccn_set_seq(n)
+    Read or set this process's outgoing sequence counter.
+    bccn_send increments it after each transmission;
+    bccn_set_seq lets the application override it
+    explicitly when needed (see "Fork handling" in the
+    conventions section for use cases).
+
+================================================================
+CONVENTION-LAYER CALLS  (optional)
+================================================================
+
+Convenience built on top of the fundamental layer.
+
+  bccn_listen(pattern, callback)
+    Register interest in a chan-name pattern. When a
+    bccn_recv returns a (src, chan, payload) where chan
+    matches the pattern under whatever matching scheme the
+    binding implements (glob, dot/slash hierarchy with
+    wildcards, regex, exact), invoke callback.
+    Example: bccn_listen("cardsys/tx/*", on_tx_event)
+
+  bccn_send_all(payload [, hmac_key])
+    Shorthand for bccn_send(my_src, "!", payload).
+
+  bccn_send_to(dst, payload [, hmac_key])
+    Shorthand for bccn_send(my_src, "!" + dst, payload).
+    dst can be a literal src ("host/name/pid") or a
+    wildcard pattern ("host/name/*", "host/*").
+
+  bccn_send_topic(topic, payload [, hmac_key])
+    Shorthand for bccn_send(my_src, topic, payload).
+
+  bccn_heartbeat_start(interval_seconds)
+    Start a periodic timer that publishes a chosen heartbeat
+    chan name (default convention: "heartbeat/" + my_src).
+
+  bccn_dispatch()
+    Pump events: read all pending datagrams from the socket,
+    match against registered listeners, invoke callbacks.
+    Called from the application's main loop, or run in its
+    own thread.
+
+Different convention layers can coexist on the same wire -
+each is just a way of assigning structure to opaque src/chan
+strings.
+
+
+
+POSSIBLE CONVENTIONS  (not mandatory)
+================================================================
+
+The protocol places no requirements on src or chan content
+beyond the reserved-character rules. Pick conventions per
+deployment. The conventions below are battle-tested defaults.
+
+Src composition:
+
+  <host>/<program>/<pid>[/<tag>]
+
+  Rationale:
+    * Hostname alone is not unique under fork. Two preforked
+      workers on relay01 both publishing seq=1 would falsely
+      dedup against each other.
+    * PID alone is not unique across hosts.
+    * host + program + pid is unique across the whole
+      topology for a process's lifetime.
+    * Optional fourth /<tag> token for sub-publishers within
+      one process (worker thread, connection id, role).
+    * The separator is '/' so embedded dots in hostnames
+      (relay01.payments.lan) don't confuse anything.
+
+  Examples:
+    relay01/cardsys-relay/12345
+    relay01.lan/cardsys-relay/12345
+    relay01/cardsys-relay/12345/worker-3
+    dashboard/monitor.pl/8821
+
+  Worst-case length budget: under 100 chars typical, well
+  inside the 128-byte field cap.
+
+  Handling unknown identity:
+
+    During early startup, before configuration is loaded, or
+    when the components needed to build the composite src
+    are not yet available, send "?" as src instead of
+    guessing or skipping the send. Switch to the real src
+    via bccn_set_name() as soon as it can be determined.
+
+    Listeners decide what to do with "?"-sourced messages:
+    accept as-is, dedup by sender IP, or filter out. All are
+    valid; the protocol layer delivers the message and
+    exposes peer IP either way.
+
+Chan composition:
+
+  '/'-delimited path, lowercase, short tokens. Examples:
+
+    cardsys/relay/tx/authorized
+    cardsys/relay/tx/declined
+    cardsys/relay/hsm/error
+    heartbeat/relay01/cardsys-relay/12345
+
+  Matching the convention used for src means the same
+  wildcard logic works on both.
+
+Subscription patterns:
+
+  Convention-layer libraries typically implement:
+
+    exact          cardsys/relay/tx/authorized
+    one-token *    cardsys/relay/*/events
+    rest >         cardsys/relay/>
+
+  This is one possible scheme. A binding could equally use
+  glob, regex, or exact-string-only matching. The wire format
+  doesn't care.
+
+Heartbeat convention:
+
+  Publish a small datagram every 5-10 seconds on:
+    heartbeat/<src>
+  Listeners that care about liveness subscribe to:
+    heartbeat/>
+  Missing heartbeats flag a dead publisher. Payload is empty
+  or carries a short status string.
+
+  Replaces broker-side last-will-and-testament for this
+  fabric.
+
+Fork handling:
+
+  What happens to src and seq after fork() is entirely the
+  application's decision. BCCN exposes bccn_get_name /
+  bccn_set_name and bccn_get_seq / bccn_set_seq so the
+  application can do whatever fits its situation. Receivers
+  tolerate any combination because each unique src has its
+  own tracker entry on the receive side.
+
+  Two common patterns:
+
+    Pattern A - new identity, fresh counter:
+
+      Child calls bccn_set_name() to adopt a new src that
+      distinguishes it from the parent, then bccn_set_seq(1)
+      to start a clean counter. Treats the child as a wholly
+      new sender. Simple, no coupling to parent state.
+
+    Pattern B - new identity, continued counter:
+
+      Child changes its name via bccn_set_name() but leaves
+      the seq counter at whatever value it inherited from
+      the parent at fork() time. The new src is enough to
+      keep the receiver's dedup tracker from colliding
+      child and parent. Continuing the seq carries a small
+      diagnostic hint: chronological ordering across the
+      src change is visible in the seq value, so a receiver
+      examining a log can tell that the child's message at
+      seq=N+1 came after the parent's seq=N.
+
+      The hint is weak once both parent and child keep
+      sending (their counters then diverge and interleave),
+      but useful for fork-and-replace patterns where the
+      parent exits.
+
+  The recommended naming convention - inherit the parent's
+  src and append "/" + child's own getpid() - is independent
+  of which counter pattern the child chooses:
+
+      parent:      relay01/cardsys-relay/12345
+      child:       relay01/cardsys-relay/12345/4711
+      grandchild:  relay01/cardsys-relay/12345/4711/9012
+
+  This lineage convention pairs naturally with directed-
+  channel targeting. Because pids are numeric and other
+  tokens (hostname, program name) are not, the classification
+  rule makes the right choice automatically:
+
+    "!relay01/cardsys-relay/12345"
+      -> EXACT: just the parent process, no forks.
+
+    "!relay01/cardsys-relay/12345/*"
+      -> WILDCARD: the parent + every fork/descendant.
+
+    "!relay01/cardsys-relay/12345/4711"
+      -> EXACT: just that specific fork.
+
+    "!relay01/cardsys-relay/12345/4711/*"
+      -> WILDCARD: that fork + its own descendants.
+
+    "!relay01/cardsys-relay"
+      "!relay01/cardsys-relay/*"
+      -> WILDCARD on a non-numeric tail; the two forms
+         select the same set: every cardsys-relay process
+         on relay01, plus all forks.
+
+    "!relay01"
+      "!relay01/*"
+      -> WILDCARD: every process on relay01.
+
+  Alternative: a worker-N tag chosen by the parent before
+  fork (relay01/cardsys-relay/12345/worker-3). The trailing
+  token is non-numeric, so targeting "!.../worker-3" is
+  implicit WILDCARD. To name a specific instance with a
+  non-numeric tag, the sender simply cannot use exact mode;
+  either accept wildcard semantics or add a numeric suffix
+  (relay01/cardsys-relay/12345/worker-3/0) which restores
+  the exact/wildcard distinction.
+
+Payload formats:
+
+  Anything goes - pipe-separated text, compact JSON, MsgPack,
+  protobuf, raw binary. Convention-layer libraries can offer
+  helpers; the protocol is bytes-in-bytes-out.
+
+These are recommendations. Replace any of them per
+deployment; the protocol does not change.
+
+
+
+WHEN BCCN IS THE RIGHT CHOICE
+----------------------------------------------------------------
+
+Yes:
+
+  -- All participants on one administered L2 segment.
+
+  -- Loss tolerance matches LISTEN/NOTIFY (acceptable).
+
+  -- Want brokerless, zero-infra, simple framing you own.
+
+  -- Mixed-language / mixed-DB topology.
+
+
+No:
+
+  -- Any participant in AWS/Azure/GCP (broadcast unsupported).
+
+  -- Receivers spread across VLANs (broadcast cannot cross).
+     Multicast delivery is planned for a later revision and
+     will address this; not yet supported in this revision.
+
+  -- Need persistence, replay, or at-least-once - use a real
+     broker.
+
+================================================================

@@ -1,6 +1,6 @@
 ##############################################################################
 #
-#  Net::BCCN Broadcast Channel Notify protocol
+#  Net::BCCN Broadcast Channel Notifications protocol
 #  (c) Vladi Belperchinov-Shabanski "Cade" 2026
 #  http://cade.noxrun.com <cade@noxrun.com>
 #
@@ -16,7 +16,8 @@ use Data::Dumper;
 
 our $VERSION = '1.1';
 
-$Data::Dumper::Terse = 1;
+$Data::Dumper::Terse    = 1;
+$Data::Dumper::Sortkeys = 1;
 
 ##############################################################################
 
@@ -74,50 +75,26 @@ sub open
 {
   my $self = shift;
 
-  my $addr = $self->{ 'ADDR' };
   my $bind = $self->{ 'BIND' };
   my $port = $self->{ 'PORT' };
 
-  $self->{ 'ERR' } = undef;
-
-  my $ss   = IO::Socket::INET->new
-    (
-    Proto     => "udp",
-    PeerAddr  => $addr,
-    PeerPort  => $port,
-    Broadcast => 1,
-    );
-
-  if( ! $ss )
-    {
-    $self->{ 'ERR' } = "udp send socket to $addr:$port failed: $!";
-    return undef;
-    }
-
-  if( ! setsockopt( $ss, SOL_SOCKET, SO_BROADCAST, 1 ) )
-    {
-    $self->{ 'ERR' } = "udp send socket set SO_BROADCAST failed: $!";
-    return undef;
-    }
-
-
-  my $rs   = IO::Socket::INET->new
+  my $sock = IO::Socket::INET->new
     (
     Proto     => "udp",
     LocalAddr => $bind,
     LocalPort => $port,
     ReuseAddr => 1,
     Blocking  => 0,
+    Broadcast => 1,
     );
 
-  if( ! $rs )
+  if( ! $sock )
     {
-    $self->{ 'ERR' } = "udp recv socket bind $bind:$port failed: $!";
+    $self->{ 'ERR' } = "udp socket bind $bind:$port failed: $!";
     return undef;
     }
 
-  $self->{ 'SS' } = $ss;
-  $self->{ 'RS' } = $rs;
+  $self->{ 'SOCK' } = $sock;
 
   return 1;
 }
@@ -129,7 +106,7 @@ sub notify
   my $chan = shift;
   my $body = shift;
 
-  my $ss = $self->{ 'SS' } or die "error: cannot notify, send socket not open, call open() first\n";
+  my $sock = $self->{ 'SOCK' } or die "error: cannot notify, udp socket not open, call open() first\n";
   $self->{ 'ERR' } = undef;
 
   my $seq = ++$self->{ 'SQ' }; # send sequence number
@@ -141,7 +118,9 @@ sub notify
   $msg = "BCCN1[$len]$msg";
   $len = length $msg;
 
-  my $sl = $ss->send( $msg );
+  my $to = pack_sockaddr_in( $self->{ 'PORT' }, inet_aton( $self->{ 'ADDR' } ) );
+
+  my $sl = $sock->send( $msg, 0, $to );
   if( ! defined( $sl ) )
     {
     dr_log("ERR: send failed: $!");
@@ -167,13 +146,13 @@ sub __pull_all_available
 
   $self->{ 'ERR' } = undef;
 
-  my $rs = $self->{ 'RS' } or die "error: cannot listen, recv socket not open, call open() first\n";
-  my $cq = $self->{ 'Q' }{ $chan } ||= []; # channel queue
+  my $sock = $self->{ 'SOCK' } or die "error: cannot notify, udp socket not open, call open() first\n";
+  my $cq   = $self->{ 'Q' }{ $chan } ||= []; # channel queue
 
   my $to = @$cq ? 0 : $opt->{ 'TIMEOUT' } || 0; # if q has messages, do not wait, just pull whatever waiting
 
   my $sel = IO::Select->new;
-  $sel->add( $rs );
+  $sel->add( $sock );
 
   my $recvc = 0;
   while (1)
@@ -184,20 +163,8 @@ sub __pull_all_available
     $to = 0;
 
     last unless @ready;
-=pod
-    if( ! @ready )
-      {
-      # no messages
-      my $xcq = $self->{ 'Q' }{ $chan } ||= []; # expected channel queue
-      last if @$xcq > 0; # exit if no more messages and expected channel q is not empty
-      last if $wait > 0; # exit with no message if we did wait some time
-      $wait = $to; # no more messages but expected q is empty, wait for more...
-      next;
-      }
-    $wait = 0;
-=cut
 
-    my $from = $rs->recv( $msg, 65535, 0 );
+    my $from = $sock->recv( $msg, 65535, 0 );
 
     if( ! defined( $from ) )
       {
@@ -335,3 +302,5 @@ sub stats
 
   return \%st;
 }
+
+1;
