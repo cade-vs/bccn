@@ -19,18 +19,11 @@ DISCLAIMER
 ================================================================
 
 Everything described here is a prototype. Working implementation
-is available in Perl from this repository. Changes above the
-baseline functionality may change anytime. This document will
-follow changes and proper documentation as far as it describes
-more concepts than the documentation. After that it may be
-dropped.
-
-BCCN is not standard of any kind, it is just a thing I need and
-do not want to use more complex existing solutions. If it looks
-like something someone may happen to need/like, help is always
-welcome :)
-
-This document may be messy too :)
+is available in Perl from this repository. Also basic reference
+implementations in C and Go can be found in the corresponding
+directories. Changes above the baseline functionality may change
+anytime. This document will follow changes and proper documentation
+as far as it describes more features than the documentation.
 
 
 
@@ -800,7 +793,8 @@ Useful supporting calls in any binding:
     explicitly when needed (see "Fork handling" in the
     conventions section for use cases).
 
-================================================================
+
+
 CONVENTION-LAYER CALLS  (optional)
 ================================================================
 
