@@ -1,0 +1,8 @@
+MANIFEST
+COPYING
+Changes
+README
+Makefile.PL
+lib/Net/BCCN.pm
+t/try-bccn-send.pl
+t/try-bccn-recv.pl
